@@ -1,114 +1,176 @@
 import os
+import glob
 import torch
-from torch.utils.data import Dataset
-import pandas as pd
-import numpy as np
-from obspy import read
-from scipy.signal import spectrogram
 import torch.nn.functional as F
-import torchvision.transforms as transforms
-
-def pad_spectrogram(spectrogram, max_length):
-    padding_size = max_length - spectrogram.shape[-1]
-    if padding_size > 0:
-        # Pad only the last dimension (time axis)
-        padded_spectrogram = F.pad(spectrogram, (0, padding_size), mode='constant', value=0)
-    else:
-        padded_spectrogram = spectrogram
-    return padded_spectrogram
+import pandas as pd
+from torch.utils.data import Dataset
+from scipy.signal import spectrogram
+import numpy as np
+import re
+from obspy import read  # Import ObsPy
 
 class SpectrogramDataset(Dataset):
-    def __init__(self, folder_path, catalog_path, labeled=True, window_size=1024, step_size=128):
-        self.data = []
-        self.labels = []
-        self.filenames = []
-        self.time_rels = []
-        self.labeled = labeled
+    def __init__(self, data_dir, catalog_file=None, window_size=8192, step_size=1024, labeled=True):
+        self.data_dir = data_dir
         self.window_size = window_size
         self.step_size = step_size
+        self.labeled = labeled
 
-        # Load the catalog for cross-referencing
-        self.catalog = pd.read_csv(catalog_path)
+        # Load the catalog if labeled data is expected
+        if self.labeled:
+            self.catalog = pd.read_csv(catalog_file)
+            print("Catalog loaded.")
+        else:
+            self.catalog = None
+            print("No catalog loaded. Data will not be labeled.")
 
-        # Load the spectrogram data
-        self.load_data(folder_path)
+        # List all .mseed files in the data directory
+        self.filenames = sorted(glob.glob(os.path.join(self.data_dir, '*.mseed')))
+        print(f"Found {len(self.filenames)} files.")
 
-    def load_data(self, folder_path):
-        for filename in os.listdir(folder_path):
-            if filename.endswith(".mseed"):
-                file_path = os.path.join(folder_path, filename)
-                stream = read(file_path)
-                trace = stream[0]
+        # Load data and labels
+        self.data, self.labels = self.load_data()
 
-                # Extract seismic data and sampling rate
-                raw_data = trace.data
-                sampling_rate = trace.stats.sampling_rate
+    def load_data(self):
+        data = []
+        labels = []
+        metadata = []
 
-                # Generate spectrogram
-                magnitude = self.generate_spectrogram(raw_data, sampling_rate)
+        for filename in self.filenames:
+            # Load the seismic data
+            try:
+                st = read(filename)
+                tr = st[0]
+                signal = tr.data.astype(np.float32)
+                sampling_rate = tr.stats.sampling_rate
+                print(f"Loaded {filename} with sampling rate {sampling_rate}.")
+                print(f"Signal length: {len(signal)}")
+            except Exception as e:
+                print(f"Error loading {filename}: {e}")
+                continue
 
-                # Normalize spectrogram
-                magnitude = (magnitude - magnitude.min()) / (magnitude.max() - magnitude.min())
+            # Split signal into windows
+            windows = self.split_signal(signal)
+            if not windows:
+                print(f"No valid windows found in {filename}. Skipping file.")
+                continue
 
-                # Split spectrogram into windows
-                spectrogram_windows = self.create_windows(magnitude)
-                self.data.extend(spectrogram_windows)
+            # Get labels
+            if self.labeled:
+                quake_time_rel = self.get_quake_time_from_catalog(filename)
+                window_labels = self.label_windows(windows, quake_time_rel, sampling_rate)
+            else:
+                window_labels = [0] * len(windows)
 
-                # Store filename for each window
-                self.filenames.extend([filename]*len(spectrogram_windows))
+            # Compute spectrograms and collect valid ones
+            valid_spectrograms = []
+            valid_labels = []
+            for window, label in zip(windows, window_labels):
+                Sxx = self.compute_spectrogram(window, sampling_rate)
+                if Sxx is not None:
+                    valid_spectrograms.append(Sxx)
+                    valid_labels.append(label)
+                    metadata.append({'filename': filename})
+                else:
+                    print("Skipping window due to invalid spectrogram.")
 
-                if self.labeled:
-                    quake_time_rel = self.get_quake_time_from_catalog(filename)
-                    label_windows = self.label_windows(spectrogram_windows, quake_time_rel, sampling_rate)
-                    self.labels.extend(label_windows)
+            if valid_spectrograms:
+                data.extend(valid_spectrograms)
+                labels.extend(valid_labels)
+            else:
+                print(f"No valid spectrograms found in {filename} after processing.")
 
-    def generate_spectrogram(self, data, fs, nperseg=256):
-        frequencies, times, Sxx = spectrogram(data, fs=fs, nperseg=nperseg)
-        return Sxx
+        self.metadata = metadata
+        return data, labels
 
-    def create_windows(self, spectrogram):
-        num_windows = (spectrogram.shape[1] - self.window_size) // self.step_size + 1
+    def split_signal(self, signal):
         windows = []
-        for i in range(num_windows):
-            start = i * self.step_size
-            end = start + self.window_size
-            window = spectrogram[:, start:end]
-            windows.append(window)
+        if len(signal) < self.window_size:
+            print(f"Signal length ({len(signal)}) is shorter than window size ({self.window_size}). Skipping signal.")
+            return windows
+        else:
+            for start in range(0, len(signal) - self.window_size + 1, self.step_size):
+                end = start + self.window_size
+                window = signal[start:end]
+                windows.append(window)
+            print(f"Number of windows generated from signal: {len(windows)}")
         return windows
 
+    def compute_spectrogram(self, window, sampling_rate):
+        nperseg = 128  # Adjusted for your data
+        noverlap = nperseg // 2  # 50% overlap
+
+        if len(window) < nperseg:
+            print(f"Window length ({len(window)}) is less than nperseg ({nperseg}). Skipping window.")
+            return None
+
+        frequencies, times, Sxx = spectrogram(
+            window,
+            fs=sampling_rate,
+            nperseg=nperseg,
+            noverlap=noverlap
+        )
+        print(f"Sxx shape: {Sxx.shape}")
+
+        if Sxx.ndim != 2 or Sxx.shape[0] <= 1 or Sxx.shape[1] <= 1:
+            print("Spectrogram computation failed or resulted in invalid output.")
+            return None
+        return Sxx
+
     def get_quake_time_from_catalog(self, filename):
-        row = self.catalog[self.catalog['filename'] == filename]
+        # Extract event ID from the filename using regex
+        match = re.search(r'evid(\d+)', filename)
+        if match:
+            event_id = int(match.group(1))
+            print(f"Extracted event ID: {event_id}")
+        else:
+            print(f"No event ID found in filename: {filename}")
+            return None
+
+        # Match event ID with the catalog
+        row = self.catalog[self.catalog['evid'] == event_id]
+
         if not row.empty:
-            return float(row['time_rel(sec)'].values[0])
-        return None
+            quake_time = row['time_rel(sec)'].values[0]
+            print(f"Quake time for event ID {event_id}: {quake_time}")
+            return float(quake_time)
+        else:
+            print(f"No quake time found for event ID {event_id}")
+            return None
 
     def label_windows(self, windows, quake_time_rel, sampling_rate):
         labels = []
-        window_duration = (self.window_size / sampling_rate)
+        window_duration = self.window_size / sampling_rate
+        step_duration = self.step_size / sampling_rate
+
         for i in range(len(windows)):
-            window_start_time = i * (self.step_size / sampling_rate)
+            window_start_time = i * step_duration
             window_end_time = window_start_time + window_duration
 
             if quake_time_rel is not None and (window_start_time <= quake_time_rel <= window_end_time):
                 labels.append(1)  # Quake present in window
+                print(f"Label 1 assigned to window {i}: Start={window_start_time:.2f}s, End={window_end_time:.2f}s")
             else:
                 labels.append(0)  # No quake in window
+
         return labels
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        spectrogram = torch.tensor(self.data[idx], dtype=torch.float32).unsqueeze(
-            0)  # Shape: [1, freq_bins, time_steps]
+        spectrogram_data = self.data[idx]  # Shape: (frequencies, times)
+        label = self.labels[idx]
 
-        # Resize spectrogram to [1, 224, 224]
-        spectrogram = F.interpolate(spectrogram.unsqueeze(0), size=(224, 224), mode='bilinear',
-                                    align_corners=False).squeeze(0)
+        # Convert to torch tensor
+        spectrogram_data = torch.tensor(spectrogram_data, dtype=torch.float32)
+        print(f"Original spectrogram shape: {spectrogram_data.shape}")  # (65, 127)
 
-        if self.labeled:
-            label = torch.tensor(self.labels[idx], dtype=torch.long)
-            return spectrogram, label
-        else:
-            metadata = {'filename': self.filenames[idx]}
-            return spectrogram, metadata
+        # Add channel dimension
+        spectrogram_data = spectrogram_data.unsqueeze(0)  # Shape: (1, 65, 127)
+
+        # No interpolation here
+
+        return spectrogram_data, label
+
+
