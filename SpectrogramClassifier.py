@@ -6,10 +6,8 @@ class SpectrogramClassifier(nn.Module):
     def __init__(self, num_classes=2, pretrained=True, freeze_features=True):
         super(SpectrogramClassifier, self).__init__()
 
-        # Load the pre-trained VGG16 model
-        self.vgg16 = models.vgg16(pretrained=pretrained)
-
-        # Modify the first convolutional layer to accept 1-channel input (grayscale/spectrogram)
+        # Load pre-trained VGG16 and modify to accept 1-channel input (grayscale)
+        self.vgg16 = models.vgg16(weights="IMAGENET1K_V1")
         self.vgg16.features[0] = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
 
         # Optionally freeze the feature layers
@@ -17,23 +15,30 @@ class SpectrogramClassifier(nn.Module):
             for param in self.vgg16.features.parameters():
                 param.requires_grad = False
 
-        # Modify the classifier to output the desired number of classes (binary classification)
+        # Modify the classifier for binary classification
         self.vgg16.classifier[6] = nn.Linear(4096, num_classes)
 
+    # Forward pass through the model
     def forward(self, x):
-        # Forward pass through the modified VGG16 model
-        x = self.vgg16(x)
+        x = self.vgg16.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.vgg16.classifier(x)
         return x
 
+    # Function to train the model
     def train_model(self, train_loader, val_loader, num_epochs=10, learning_rate=0.001):
-        # Define optimizer only for parameters that require gradient (i.e., unfrozen layers)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)  # Move the model to the appropriate device
+
         optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=learning_rate)
         criterion = nn.CrossEntropyLoss()
 
         for epoch in range(num_epochs):
-            self.train()
+            self.train()  # Set the model to training mode
             running_loss = 0.0
             for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
                 optimizer.zero_grad()
                 outputs = self.forward(inputs)
                 loss = criterion(outputs, labels)
@@ -41,13 +46,15 @@ class SpectrogramClassifier(nn.Module):
                 optimizer.step()
                 running_loss += loss.item()
 
-            print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}')
+            avg_loss = running_loss / len(train_loader)
+            print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
-            # Validation loop
-            self.eval()
+            # Validation phase
+            self.eval()  # Set the model to evaluation mode
             correct, total = 0, 0
             with torch.no_grad():
                 for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
                     outputs = self.forward(inputs)
                     _, predicted = torch.max(outputs.data, 1)
                     total += labels.size(0)
@@ -56,20 +63,19 @@ class SpectrogramClassifier(nn.Module):
             val_accuracy = 100 * correct / total
             print(f'Validation Accuracy: {val_accuracy:.2f}%')
 
+    # Function to predict test data
     def predict(self, test_loader):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)
         self.eval()
-        predictions = []
-        filenames = []
-        time_rels = []
+        predictions, filenames = [], []
 
         with torch.no_grad():
             for inputs, metadata in test_loader:
+                inputs = inputs.to(device)
                 outputs = self.forward(inputs)
                 _, predicted = torch.max(outputs.data, 1)
                 predictions.extend(predicted.cpu().numpy())
-
-                # Extract filenames and time_rel from metadata
                 filenames.extend(metadata['filename'])
-                time_rels.extend(metadata['time_rel'])
 
-        return predictions, filenames, time_rels
+        return predictions, filenames
