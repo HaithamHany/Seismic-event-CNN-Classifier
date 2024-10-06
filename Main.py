@@ -41,8 +41,8 @@ def main():
         val_size = len(train_dataset_full) - train_size
         train_dataset, val_dataset = random_split(train_dataset_full, [train_size, val_size])
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
         # Check class distribution
         train_labels = [label for _, label in train_dataset]

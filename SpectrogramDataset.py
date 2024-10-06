@@ -8,6 +8,7 @@ from scipy.signal import spectrogram
 import numpy as np
 import re
 from obspy import read  # Import ObsPy
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SpectrogramDataset(Dataset):
     def __init__(self, data_dir, catalog_file=None, window_size=8192, step_size=1024, labeled=True):
@@ -169,7 +170,11 @@ class SpectrogramDataset(Dataset):
         # Add channel dimension
         spectrogram_data = spectrogram_data.unsqueeze(0)  # Shape: (1, 65, 127)
 
-        # No interpolation here
+        # Move to device (GPU if available)
+        spectrogram_data = spectrogram_data.to(device)
+
+        # Move label to the device as well
+        label = torch.tensor(label, dtype=torch.float32).to(device)
 
         return spectrogram_data, label
 
